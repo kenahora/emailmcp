@@ -5,8 +5,11 @@ An authenticated, stateless email MCP server deployed to Vercel. Supports Purely
 ## Environment variables
 
 Configure these on the Vercel project for Production (never commit actual values):
-- `MAIL_USER`: mailbox address
-- `MAIL_PASSWORD`: dedicated mailbox/app password
+- `MAIL_AARON_USER`: Aaron's mailbox address (already set to `aaron@kenahora.net`)
+- `MAIL_AARON_PASSWORD`: Aaron's mailbox password (optional replacement for existing `MAIL_PASSWORD`)
+- `MAIL_ZARINA_USER`: Zarina's full mailbox address
+- `MAIL_ZARINA_PASSWORD`: Zarina's mailbox password
+- `MAIL_USER` / `MAIL_PASSWORD`: legacy Aaron credentials, supported for backward compatibility. Existing sensitive `MAIL_PASSWORD` remains valid; there is no need to expose or reset it.
 - `IMAP_HOST`: `imap.purelymail.com`
 - `SMTP_HOST`: `smtp.purelymail.com`
 - `MCP_API_KEY`: strong random secret of at least 32 characters (e.g. `openssl rand -hex 32`)
@@ -26,7 +29,18 @@ curl -i https://<your-vercel-domain>/mcp
 
 To connect using an MCP client, configure Streamable HTTP transport and supply the bearer token through that client's secure credential storage. Do not put the token in the endpoint URL.
 
+## Named accounts
+
+All mailbox operations accept `mailbox: "aaron" | "zarina"`, defaulting to `aaron` so existing Muse tool calls keep working. The `list_accounts` tool reveals configured addresses and readiness but never credentials. A request for an account whose credentials are absent returns a clear error rather than accidentally falling back to Aaron.
+
+Each account has independent IMAP access, SMTP sender identity, Sent/Drafts folders, and message UIDs. Switching a mailbox never copies messages between accounts.
+
+```json
+{ "mailbox": "zarina", "folder": "Sent", "limit": 10 }
+```
+
 ## Tools
+- `list_accounts`: show configured mailbox IDs, email addresses, and configuration status without revealing secrets.
 
 - `list_folders`: list selectable IMAP folders, including standard special folders and counts.
 - `list_emails`: latest 1–25 messages in any folder. Defaults to INBOX; pass `folder: "Sent"` for outgoing mail.
