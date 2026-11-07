@@ -409,7 +409,7 @@ const handler = createMcpHandler((server) => {
     async (draft) => {
       try {
         const raw = await buildRawMessage(draft.mailbox, draft);
-        return toolResult(await withMailbox(mailbox, async client => {
+        return toolResult(await withMailbox(draft.mailbox, async client => {
           const folder = await ensureSpecialFolder(client, "Drafts");
           const result = await client.append(folder, raw, ["\\Draft", "\\Seen"], new Date());
           if (!result) throw new Error("Draft append failed");
