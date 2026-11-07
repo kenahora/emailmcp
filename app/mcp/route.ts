@@ -142,7 +142,8 @@ async function buildRawMessage(message: {
     disableFileAccess: true,
     disableUrlAccess: true,
   });
-  const raw: Buffer = Buffer.isBuffer(compiled.message) ? compiled.message : Buffer.from(compiled.message);
+  const raw = compiled.message as unknown as Buffer;
+  if (!Buffer.isBuffer(raw)) throw new Error("MIME compilation failed");
   if (raw.length > 3_800_000) throw new Error("Message exceeds transport size limit");
   return raw;
 }
