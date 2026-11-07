@@ -10,17 +10,34 @@ export const maxDuration = 60;
 
 type EnvelopeAddress = { name?: string; address?: string };
 
-function credentials() {
-  const username = process.env.MAIL_USER;
-  const password = process.env.MAIL_PASSWORD;
-  if (!username || !password) {
-    throw new Error("Purelymail credentials are not configured.");
+const mailboxInput = z.enum(["aaron", "zarina"]).default("aaron");
+type MailboxId = z.infer<typeof mailboxInput>;
+
+class MailboxNotConfigured extends Error {
+  constructor(public readonly mailbox: MailboxId) {
+    super("Mailbox " + mailbox + " is not configured");
   }
+}
+
+function mailboxConfig(mailbox: MailboxId) {
+  if (mailbox === "zarina") {
+    return { username: process.env.MAIL_ZARINA_USER, password: process.env.MAIL_ZARINA_PASSWORD };
+  }
+  // Backward compatibility for deployments created before the named Aaron variables.
+  return {
+    username: process.env.MAIL_AARON_USER || process.env.MAIL_USER,
+    password: process.env.MAIL_AARON_PASSWORD || process.env.MAIL_PASSWORD,
+  };
+}
+
+function credentials(mailbox: MailboxId) {
+  const { username, password } = mailboxConfig(mailbox);
+  if (!username || !password) throw new MailboxNotConfigured(mailbox);
   return { username, password };
 }
 
-async function withMailbox<T>(fn: (client: ImapFlow) => Promise<T>): Promise<T> {
-  const { username, password } = credentials();
+async function withMailbox<T>(mailbox: MailboxId, fn: (client: ImapFlow) => Promise<T>): Promise<T> {
+  const { username, password } = credentials(mailbox);
   const client = new ImapFlow({
     host: process.env.IMAP_HOST || "imap.purelymail.com",
     port: 993,
@@ -73,6 +90,9 @@ function toolResult(value: unknown) {
 }
 
 function safeError(error: unknown) {
+  if (error instanceof MailboxNotConfigured) {
+    return { content: [{ type: "text" as const, text: "Mailbox " + error.mailbox + " is not configured on the server." }], isError: true };
+  }
   // Never return protocol errors or connection details to the language model.
   console.error("Mail tool operation failed:", error instanceof Error ? error.name : "unknown");
   return { content: [{ type: "text" as const, text: "The mail operation failed. Check server configuration or retry." }], isError: true };
@@ -124,11 +144,11 @@ function attachmentsToBuffers(input?: AttachInput[]) {
   return data;
 }
 
-async function buildRawMessage(message: {
+async function buildRawMessage(mailbox: MailboxId, message: {
   to: string[]; cc?: string[]; subject: string; body: string;
   inReplyTo?: string; references?: string; attachments?: AttachInput[];
 }) {
-  const { username } = credentials();
+  const { username } = credentials(mailbox);
   const composer = nodemailer.createTransport({ streamTransport: true, buffer: true });
   const compiled = await composer.sendMail({
     from: username,
@@ -164,17 +184,31 @@ async function parsedMessage(client: ImapFlow, folder: string, uid: number) {
 
 
 const handler = createMcpHandler((server) => {
+
+  server.registerTool(
+    "list_accounts",
+    {
+      title: "List configured email accounts",
+      description: "List the available named email accounts (aaron and zarina), their configured email addresses, and whether credentials are available. Never returns secrets.",
+      inputSchema: z.object({}).strict(),
+      annotations: { readOnlyHint: true, destructiveHint: false },
+    },
+    async () => toolResult((["aaron", "zarina"] as const).map(mailbox => {
+      const config = mailboxConfig(mailbox);
+      return { mailbox, address: config.username || null, configured: Boolean(config.username && config.password), default: mailbox === "aaron" };
+    }))
+  );
   server.registerTool(
     "list_emails",
     {
       title: "List recent emails",
-      description: "List up to 25 newest messages in INBOX, Sent, Drafts, Archive or any folder. Set folder for non-INBOX mail. Returns metadata only.",
-      inputSchema: z.object({ limit: z.number().int().min(1).max(25).default(10), folder: folderInput }).strict(),
+      description: "Select mailbox=aaron (default) or zarina. List up to 25 newest messages in INBOX, Sent, Drafts, Archive or any other folder.",
+      inputSchema: z.object({ limit: z.number().int().min(1).max(25).default(10), folder: folderInput, mailbox: mailboxInput }).strict(),
       annotations: { readOnlyHint: true, destructiveHint: false },
     },
-    async ({ limit, folder }) => {
+    async ({ limit, folder, mailbox }) => {
       try {
-        return toolResult(await withMailbox(async client => {
+        return toolResult(await withMailbox(mailbox, async client => {
           const path = await resolveFolder(client, folder);
           const lock = await client.getMailboxLock(path, { readOnly: true });
           try {
@@ -197,8 +231,9 @@ const handler = createMcpHandler((server) => {
     "search_emails",
     {
       title: "Search inbox",
-      description: "Search any mailbox by sender, subject, and/or text. Set folder=Sent to retrieve previous outgoing emails. Returns bounded metadata.",
+      description: "Search a named account and folder by sender, subject or text. Use mailbox=aaron or zarina and folder=Sent for outbound follow-ups.",
       inputSchema: z.object({
+        mailbox: mailboxInput,
         folder: folderInput,
         from: z.string().min(1).max(200).optional(),
         subject: z.string().min(1).max(200).optional(),
@@ -207,9 +242,9 @@ const handler = createMcpHandler((server) => {
       }).strict().refine(v => Boolean(v.from || v.subject || v.text), "Provide at least one search filter"),
       annotations: { readOnlyHint: true, destructiveHint: false },
     },
-    async ({ folder, from, subject, text, limit }) => {
+    async ({ mailbox, folder, from, subject, text, limit }) => {
       try {
-        return toolResult(await withMailbox(async client => {
+        return toolResult(await withMailbox(mailbox, async client => {
           const path = await resolveFolder(client, folder);
           const lock = await client.getMailboxLock(path, { readOnly: true });
           try {
@@ -235,13 +270,13 @@ const handler = createMcpHandler((server) => {
     "read_email",
     {
       title: "Read a message",
-      description: "Read a message by UID from any folder (including Sent). Returns body, thread headers and attachment metadata. Does not change read status.",
-      inputSchema: z.object({ uid: z.number().int().positive(), folder: folderInput }).strict(),
+      description: "Read an email in the chosen mailbox and folder by UID; returns text and attachment metadata without changing read status.",
+      inputSchema: z.object({ uid: z.number().int().positive(), folder: folderInput, mailbox: mailboxInput }).strict(),
       annotations: { readOnlyHint: true, destructiveHint: false },
     },
-    async ({ uid, folder }) => {
+    async ({ uid, folder, mailbox }) => {
       try {
-        return toolResult(await withMailbox(async client => {
+        return toolResult(await withMailbox(mailbox, async client => {
           const result = await parsedMessage(client, folder, uid);
           if (!result) return { error: "Message not found" };
           if (result.tooLarge) return { error: "Email exceeds 12 MB parsing limit", folder: result.path, ...summary(result.info) };
@@ -265,8 +300,9 @@ const handler = createMcpHandler((server) => {
     "prepare_email",
     {
       title: "Prepare an email for review",
-      description: "Preview outgoing mail without sending or saving. Must show recipients, subject, body, and attachment names for approval.",
+      description: "Preview an outgoing email from the selected mailbox before sending. Show the user selected sender, recipients, subject, body and attachment names.",
       inputSchema: z.object({
+        mailbox: mailboxInput,
         to: recipientList,
         cc: optionalRecipients,
         subject: z.string().min(1).max(250),
@@ -275,15 +311,16 @@ const handler = createMcpHandler((server) => {
       }).strict(),
       annotations: { readOnlyHint: true, destructiveHint: false },
     },
-    async (draft) => toolResult({ from: process.env.MAIL_USER, to: draft.to, cc: draft.cc, subject: draft.subject, body: draft.body, attachments: draft.attachments?.map(a => ({ filename: a.filename, contentType: a.contentType, size: Buffer.from(a.contentBase64, "base64").length })), status: "PREVIEW_ONLY_NOT_SENT" })
+    async (draft) => toolResult({ from: mailboxConfig(draft.mailbox).username || null, mailbox: draft.mailbox, to: draft.to, cc: draft.cc, subject: draft.subject, body: draft.body, attachments: draft.attachments?.map(a => ({ filename: a.filename, contentType: a.contentType, size: Buffer.from(a.contentBase64, "base64").length })), status: "PREVIEW_ONLY_NOT_SENT" })
   );
 
   server.registerTool(
     "send_email",
     {
       title: "Send an email",
-      description: "Send a real email with optional base64 attachments. Requires explicit user approval of recipients, subject, body and attachments, then confirm_send=true. Attempts to save exact sent MIME to Sent.",
+      description: "Send email from the selected mailbox via its SMTP credentials; explicit user approval needed. Includes optional attachments; attempts Sent copy.",
       inputSchema: z.object({
+        mailbox: mailboxInput,
         to: recipientList,
         cc: optionalRecipients,
         subject: z.string().min(1).max(250),
@@ -295,11 +332,11 @@ const handler = createMcpHandler((server) => {
       }).strict(),
       annotations: { readOnlyHint: false, destructiveHint: true },
     },
-    async ({ to, cc, subject, body, inReplyTo, references, attachments }) => {
+    async ({ mailbox, to, cc, subject, body, inReplyTo, references, attachments }) => {
       let sent = false;
       try {
-        const { username, password } = credentials();
-        const raw = await buildRawMessage({ to, cc, subject, body, inReplyTo, references, attachments });
+        const { username, password } = credentials(mailbox);
+        const raw = await buildRawMessage(mailbox, { to, cc, subject, body, inReplyTo, references, attachments });
         const smtp = nodemailer.createTransport({
           host: process.env.SMTP_HOST || "smtp.purelymail.com",
           port: 465, secure: true,
@@ -312,7 +349,7 @@ const handler = createMcpHandler((server) => {
         });
         sent = true;
         try {
-          const saved = await withMailbox(async client => {
+          const saved = await withMailbox(mailbox, async client => {
             const path = await ensureSpecialFolder(client, "Sent");
             const result = await client.append(path, raw, ["\\Seen"], new Date());
             if (!result) throw new Error("Unable to append Sent copy");
@@ -335,13 +372,13 @@ const handler = createMcpHandler((server) => {
     "list_folders",
     {
       title: "List email folders",
-      description: "List IMAP folders and identify Sent, Drafts, Trash, and Archive. Shows message and unread counts where available.",
-      inputSchema: z.object({}).strict(),
+      description: "List IMAP folders for the selected account, including Sent, Drafts, Trash and Archive.",
+      inputSchema: z.object({ mailbox: mailboxInput }).strict(),
       annotations: { readOnlyHint: true, destructiveHint: false },
     },
-    async () => {
+    async ({ mailbox }) => {
       try {
-        return toolResult(await withMailbox(async client => {
+        return toolResult(await withMailbox(mailbox, async client => {
           const folders = await client.list({ statusQuery: { messages: true, unseen: true } });
           return folders.slice(0, 100).map(f => ({
             folder: f.path, specialUse: f.specialUse || null,
@@ -358,8 +395,9 @@ const handler = createMcpHandler((server) => {
     "save_draft",
     {
       title: "Save an email draft",
-      description: "Save a persistent RFC 822 draft to Purelymail's Drafts folder, including attachments if supplied. Does not send.",
+      description: "Save a persistent draft, optionally with attachments, to the selected account's Drafts folder. Does not send.",
       inputSchema: z.object({
+        mailbox: mailboxInput,
         to: recipientList, cc: optionalRecipients, subject: z.string().min(1).max(250),
         body: z.string().min(1).max(20000),
         inReplyTo: z.string().max(998).optional(),
@@ -370,8 +408,8 @@ const handler = createMcpHandler((server) => {
     },
     async (draft) => {
       try {
-        const raw = await buildRawMessage(draft);
-        return toolResult(await withMailbox(async client => {
+        const raw = await buildRawMessage(draft.mailbox, draft);
+        return toolResult(await withMailbox(mailbox, async client => {
           const folder = await ensureSpecialFolder(client, "Drafts");
           const result = await client.append(folder, raw, ["\\Draft", "\\Seen"], new Date());
           if (!result) throw new Error("Draft append failed");
@@ -385,16 +423,17 @@ const handler = createMcpHandler((server) => {
     "download_attachment",
     {
       title: "Download an email attachment",
-      description: "Return one attachment as base64 for a message in any folder. Max 2 MB per attachment; 12 MB max enclosing email. Data is sensitive and must not be executed.",
+      description: "Download a base64 attachment from a message in the selected account and folder, with size limits.",
       inputSchema: z.object({
+        mailbox: mailboxInput,
         uid: z.number().int().positive(), folder: folderInput,
         index: z.number().int().min(0).max(29),
       }).strict(),
       annotations: { readOnlyHint: true, destructiveHint: false },
     },
-    async ({ uid, folder, index }) => {
+    async ({ mailbox, uid, folder, index }) => {
       try {
-        return toolResult(await withMailbox(async client => {
+        return toolResult(await withMailbox(mailbox, async client => {
           const result = await parsedMessage(client, folder, uid);
           if (!result) return { error: "Message not found" };
           if (result.tooLarge) return { error: "Email exceeds 12 MB parsing limit" };
@@ -415,16 +454,17 @@ const handler = createMcpHandler((server) => {
     "archive_email",
     {
       title: "Archive one email",
-      description: "Moves exactly one message by UID to the Archive folder (creates Archive if necessary). Obtain explicit user confirmation of source folder and UID before use.",
+      description: "Move a single UID within the selected account to Archive. Requires confirmation of account, folder and message.",
       inputSchema: z.object({
+        mailbox: mailboxInput,
         uid: z.number().int().positive(), folder: folderInput,
         confirm_archive: z.literal(true),
       }).strict(),
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
     },
-    async ({ uid, folder }) => {
+    async ({ mailbox, uid, folder }) => {
       try {
-        return toolResult(await withMailbox(async client => {
+        return toolResult(await withMailbox(mailbox, async client => {
           const source = await resolveFolder(client, folder);
           const dest = await ensureSpecialFolder(client, "Archive");
           if (source === dest) return { status: "ALREADY_ARCHIVED", folder: source, uid };
@@ -445,16 +485,17 @@ const handler = createMcpHandler((server) => {
     "delete_email",
     {
       title: "Move one email to Trash",
-      description: "Soft-delete: move exactly one UID to Trash, never permanently expunge. Obtain explicit user confirmation before use. No bulk delete.",
+      description: "Soft-delete one UID within the selected account by moving to Trash. Requires confirmation of account, folder and message.",
       inputSchema: z.object({
+        mailbox: mailboxInput,
         uid: z.number().int().positive(), folder: folderInput,
         confirm_delete: z.literal(true),
       }).strict(),
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
     },
-    async ({ uid, folder }) => {
+    async ({ mailbox, uid, folder }) => {
       try {
-        return toolResult(await withMailbox(async client => {
+        return toolResult(await withMailbox(mailbox, async client => {
           const source = await resolveFolder(client, folder);
           const dest = await ensureSpecialFolder(client, "Trash");
           if (source === dest) return { status: "ALREADY_IN_TRASH", folder: source, uid };
