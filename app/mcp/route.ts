@@ -49,10 +49,10 @@ function summary(message: {
     subject?: string;
     from?: EnvelopeAddress[];
     to?: EnvelopeAddress[];
-    date?: Date;
+    date?: Date | string;
     messageId?: string;
   };
-  internalDate?: Date;
+  internalDate?: Date | string;
   size?: number;
   flags?: Set<string>;
 }) {
@@ -61,7 +61,7 @@ function summary(message: {
     subject: message.envelope?.subject || "(no subject)",
     from: addresses(message.envelope?.from),
     to: addresses(message.envelope?.to),
-    date: message.internalDate?.toISOString() || message.envelope?.date?.toISOString() || null,
+    date: (message.internalDate ? new Date(message.internalDate).toISOString() : null) || (message.envelope?.date ? new Date(message.envelope.date).toISOString() : null),
     messageId: message.envelope?.messageId || null,
     size: message.size ?? null,
     seen: message.flags?.has("\\Seen") ?? false,
